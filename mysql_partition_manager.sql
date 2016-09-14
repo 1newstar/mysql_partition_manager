@@ -30,8 +30,10 @@ manage_partitions_loop: loop
 
 
 	# verification
-
-	select if(t.create_options like '%partitioned%',null,ceil(unix_timestamp()/ifnull(p_increment,1))*ifnull(p_increment,1))
+    # 通过information_schema库下的TABLES表的create_options检查表的分区状态
+    # 若不是分区表，通过ALTER TABLE命令进行转化
+	
+    select if(t.create_options like '%partitioned%',null,ceil(unix_timestamp()/ifnull(p_increment,1))*ifnull(p_increment,1))
 		from information_schema.tables t
 		where t.table_schema=DATABASE()
 		and t.table_name=p_table
@@ -39,6 +41,7 @@ manage_partitions_loop: loop
 
 	if current_val is not null then
 		set partition_list:='';
+        # 根据p_retain设置保留的分区数量
 		if p_retain is not null then
 			while current_val>run_timestamp-p_retain do
 				set current_val:=current_val-p_increment;
@@ -46,16 +49,17 @@ manage_partitions_loop: loop
 			end while;
 		end if;
 		
+        # 动态SQL创建分区
 		SET @sql:=CONCAT('alter table ',p_table,' partition by range (',p_column,') (partition p_START values less than (0),',partition_list,'partition p_END values less than MAXVALUE)');
 		PREPARE stmt FROM @sql;
 		EXECUTE stmt;
 		deallocate prepare stmt;
 	end if;
 
-
 	# add
+    # 新增分区，每次根据p_granularity，创建多个分区
 
-	if p_buffer is not null then
+    if p_buffer is not null then
 		select ifnull(max(p.partition_description)*p_granularity,floor(unix_timestamp()/p_increment)*p_increment)
 			from information_schema.partitions p
 			where p.table_schema=DATABASE()
@@ -79,7 +83,8 @@ manage_partitions_loop: loop
 	
 
 	# purge
-	
+	# 删除分区
+
 	if p_retain is not null then
 		set partition_list='';
 		select group_concat(p.partition_name separator ',')
@@ -112,8 +117,10 @@ DELIMITER ;
 drop event if exists run_partition_manager;
 
 DELIMITER ;;
+# 初始每天执行1次自动化分区操作
 CREATE DEFINER=`root`@`localhost` EVENT `run_partition_manager` ON SCHEDULE EVERY 86400 SECOND STARTS '2000-01-01 00:00:00' ON COMPLETION PRESERVE ENABLE DO
 BEGIN
+# 从机无需执行
 IF @@global.read_only=0 THEN
 	CALL partition_manager();
 END IF;
@@ -133,6 +140,7 @@ select min(s.increment)
 from partition_manager_settings s
 into min_increment;
 
+# 根据最小间隔调整自动分区任务调度时间
 if min_increment is not null then
 	ALTER DEFINER='root'@'localhost' EVENT run_partition_manager ON SCHEDULE EVERY min_increment SECOND STARTS '2000-01-01 00:00:00' ENABLE;
 end if;
@@ -142,6 +150,9 @@ delimiter ;
 
 
 drop procedure if exists install_partition_manager;
+
+# 初始化分区配置表partition_manager_settings
+# 若已存在分区配置表，导入到新表
 
 DELIMITER ;;
 CREATE DEFINER=`root`@`localhost` PROCEDURE `install_partition_manager`()
